@@ -141,66 +141,193 @@ export function initDb() {
   const netlifySentimentStrat = {
     id: 'basic_stier_market_sentiment',
     name: 'Basic - S tier + Market Sentiment',
-    description: 'Combines Technical Signals with live/historical Market Sentiment API (clinquant-tulumba-c7b230.netlify.app)',
-    code: `// Basic - S tier + Market Sentiment Strategy
-async function fetchMarketScore(timestampMs) {
-  // Format Unix timestamp (ms) to UTC Hourly ISO string (YYYY-MM-DDTHH:00:00Z)
+    description: 'Technical Trend & Breakout Strategy with Market Sentiment API Filter (Optimized API Execution)',
+    code: `/**
+ * Momentum + Trend Strategy with Market Sentiment Filter (Optimized Execution)
+ *
+ * Execution Logic:
+ * 1. Calculate Technical Indicators (EMA 50/200, Bollinger Bands 20,2, RSI 14, ATR 14).
+ * 2. Evaluate Technical Setup (canBuy / canSell).
+ * 3. ONLY if technical setup triggers, query Market Sentiment API as final check (SAVES 99% API CALLS!).
+ */
+async function fetchMarketScore(timestampMs, apiBaseUrl) {
   const d = new Date(timestampMs);
   const year = d.getUTCFullYear();
   const month = String(d.getUTCMonth() + 1).padStart(2, '0');
   const day = String(d.getUTCDate()).padStart(2, '0');
   const hour = String(d.getUTCHours()).padStart(2, '0');
-  const isoHour = \`\${year}-\${month}-\${day}T\${hour}:00:00Z\`;
+  const cacheKey = \`\${year}-\${month}-\${day}T\${hour}:00:00Z\`;
 
-  const url = \`https://clinquant-tulumba-c7b230.netlify.app/api/score/timestamp/\${isoHour}\`;
+  const baseUrl = apiBaseUrl || "https://clinquant-tulumba-c7b230.netlify.app/api/score/timestamp/";
+  const url = baseUrl.endsWith('/') ? \`\${baseUrl}\${cacheKey}\` : \`\${baseUrl}/\${cacheKey}\`;
 
   try {
     if (typeof cachedFetch === 'function') {
       const res = await cachedFetch(url);
       if (res && res.data && typeof res.data.market_score === 'number') {
-        return res.data.market_score;
+        return { score: res.data.market_score, signal: res.data.signal || 'Neutral' };
       }
     }
   } catch (err) {
-    console.error('Market Score API Error:', err.message);
+    console.error('Sentiment API fetch error:', err.message);
   }
-  return 0.5; // Default neutral fallback
+  return { score: 0.50, signal: 'Neutral' };
 }
 
 async function onCandle(candle, history, state, params) {
-  if (history.length < 5) return null;
+  // --- Parameters ---
+  const emaFast         = params.emaFast         || 50;
+  const emaSlow         = params.emaSlow         || 200;
+  const rsiPeriod       = params.rsiPeriod       || 14;
+  const bbPeriod        = params.bbPeriod        || 20;
+  const bbStd           = params.bbStd           || 2.0;
+  const atrPeriod       = params.atrPeriod       || 14;
+  const slMultiplier    = params.slMultiplier    || 1.5;
+  const tpMultiplier    = params.tpMultiplier    || 3.0;
 
-  // 1. Fetch market score from 3rd-party API
-  const score = await fetchMarketScore(candle.timestamp);
+  const useSentiment    = params.useSentiment !== undefined ? params.useSentiment : true;
+  const minScoreForBuy  = params.minScoreForBuy  || 0.40;  // Below this, don't BUY
+  const maxScoreForSell = params.maxScoreForSell || 0.60;  // Above this, don't SELL
+  const apiBaseUrl      = params.apiBaseUrl || "https://clinquant-tulumba-c7b230.netlify.app/api/score/timestamp/";
 
-  const slPct = params.slPct || 0.5;
-  const tpPct = params.tpPct || 1.0;
+  // Ensure sufficient history for indicators
+  const minRequired = Math.max(emaSlow, bbPeriod, rsiPeriod, atrPeriod) + 2;
+  if (history.length < minRequired) return null;
 
-  // 2. Execute trades based on Quant Strategy Matrix Thresholds
-  // Score > 0.60 -> Bullish (Buy)
-  if (score > 0.60) {
-    return { action: 'BUY', slPct, tpPct };
+  const closes = history.map(c => c.close);
+  const highs  = history.map(c => c.high);
+  const lows   = history.map(c => c.low);
+
+  // 1. Calculate EMAs
+  function calcEMA(prices, period) {
+    if (prices.length < period) return null;
+    const k = 2 / (period + 1);
+    let ema = prices.slice(0, period).reduce((a, b) => a + b, 0) / period;
+    for (let i = period; i < prices.length; i++) {
+      ema = (prices[i] * k) + (ema * (1 - k));
+    }
+    return ema;
   }
 
-  // Score < 0.40 -> Bearish (Sell)
-  if (score < 0.40) {
-    return { action: 'SELL', slPct, tpPct };
+  const emaFastVal = calcEMA(closes, emaFast);
+  const emaSlowVal = calcEMA(closes, emaSlow);
+  if (emaFastVal === null || emaSlowVal === null) return null;
+
+  // 2. Calculate Bollinger Bands
+  function calcBB(prices, period, stdDev) {
+    const slice = prices.slice(-period);
+    const sma = slice.reduce((a, b) => a + b, 0) / period;
+    const variance = slice.reduce((sum, p) => sum + (p - sma) ** 2, 0) / period;
+    const std = Math.sqrt(variance);
+    return { upper: sma + stdDev * std, lower: sma - stdDev * std, mid: sma };
   }
 
-  // 0.40 <= score <= 0.60 -> Neutral (No New Trade)
+  const bb = calcBB(closes, bbPeriod, bbStd);
+  const currentClose = candle.close;
+  const prevClose = history[history.length - 2]?.close || currentClose;
+
+  // 3. Calculate RSI
+  function calcRSI(prices, period) {
+    if (prices.length < period + 1) return 50;
+    let gains = 0, losses = 0;
+    const start = prices.length - period;
+    for (let i = start; i < prices.length; i++) {
+      const diff = prices[i] - prices[i - 1];
+      if (diff >= 0) gains += diff;
+      else losses -= diff;
+    }
+    const avgGain = gains / period;
+    const avgLoss = losses / period;
+    if (avgLoss === 0) return 100;
+    const rs = avgGain / avgLoss;
+    return 100 - (100 / (1 + rs));
+  }
+
+  const rsi = calcRSI(closes, rsiPeriod);
+
+  // 4. Calculate ATR for stop/target
+  function calcATR(highs, lows, closes, period) {
+    if (highs.length < period + 1) return null;
+    let trSum = 0;
+    for (let i = highs.length - period; i < highs.length; i++) {
+      const pClose = closes[i - 1];
+      const tr = Math.max(highs[i] - lows[i], Math.abs(highs[i] - pClose), Math.abs(lows[i] - pClose));
+      trSum += tr;
+    }
+    return trSum / period;
+  }
+
+  const atr = calcATR(highs, lows, closes, atrPeriod);
+  if (!atr) return null;
+
+  // 5. Technical Conditions
+  const isUptrend   = emaFastVal > emaSlowVal && currentClose > emaSlowVal;
+  const isDowntrend = emaFastVal < emaSlowVal && currentClose < emaSlowVal;
+
+  const crossedAboveUpper = prevClose <= bb.upper && currentClose > bb.upper;
+  const crossedBelowLower = prevClose >= bb.lower && currentClose < bb.lower;
+
+  const canBuy  = isUptrend && rsi > 50 && rsi < 70 && crossedAboveUpper;
+  const canSell = isDowntrend && rsi < 50 && rsi > 30 && crossedBelowLower;
+
+  // --- OPTIMIZATION SHORTCUT ---
+  // If technical conditions aren't met, return null immediately (SAVES 99% API CALLS!)
+  if (!canBuy && !canSell) return null;
+
+  // 6. FINAL CHECK: Fetch market sentiment ONLY when technical setup triggers
+  let marketScore = 0.50;
+  let signalLabel = 'Neutral';
+
+  if (useSentiment) {
+    const sentiment = await fetchMarketScore(candle.timestamp, apiBaseUrl);
+    marketScore = sentiment.score;
+    signalLabel = sentiment.signal;
+  }
+
+  // --- BUY Execution ---
+  if (canBuy && marketScore >= minScoreForBuy) {
+    const slPrice = currentClose - slMultiplier * atr;
+    const tpPrice = currentClose + tpMultiplier * atr;
+    state._lastTrade = { type: 'BUY', sentiment: { score: marketScore, signal: signalLabel }, timestamp: candle.timestamp };
+    return { action: 'BUY', slPrice, tpPrice };
+  }
+
+  // --- SELL Execution ---
+  if (canSell && marketScore <= maxScoreForSell) {
+    const slPrice = currentClose + slMultiplier * atr;
+    const tpPrice = currentClose - tpMultiplier * atr;
+    state._lastTrade = { type: 'SELL', sentiment: { score: marketScore, signal: signalLabel }, timestamp: candle.timestamp };
+    return { action: 'SELL', slPrice, tpPrice };
+  }
+
   return null;
 }`,
-    params: JSON.stringify({ slPct: 0.5, tpPct: 1.0 }),
+    params: JSON.stringify({
+      emaFast: 50,
+      emaSlow: 200,
+      rsiPeriod: 14,
+      bbPeriod: 20,
+      bbStd: 2.0,
+      atrPeriod: 14,
+      slMultiplier: 1.5,
+      tpMultiplier: 3.0,
+      useSentiment: true,
+      minScoreForBuy: 0.40,
+      maxScoreForSell: 0.60,
+      apiBaseUrl: "https://clinquant-tulumba-c7b230.netlify.app/api/score/timestamp/"
+    }),
     created_at: new Date().toISOString()
   };
 
-  const existingStrat = db.prepare('SELECT id FROM strategies WHERE id = ?').get(netlifySentimentStrat.id);
-  if (!existingStrat) {
-    db.prepare(`
-      INSERT INTO strategies (id, name, description, code, params, created_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(netlifySentimentStrat.id, netlifySentimentStrat.name, netlifySentimentStrat.description, netlifySentimentStrat.code, netlifySentimentStrat.params, netlifySentimentStrat.created_at);
-  }
+  db.prepare(`
+    INSERT INTO strategies (id, name, description, code, params, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      name=excluded.name,
+      description=excluded.description,
+      code=excluded.code,
+      params=excluded.params
+  `).run(netlifySentimentStrat.id, netlifySentimentStrat.name, netlifySentimentStrat.description, netlifySentimentStrat.code, netlifySentimentStrat.params, netlifySentimentStrat.created_at);
 
   const stratCount = db.prepare('SELECT COUNT(*) as count FROM strategies').get().count;
   if (stratCount === 0) {
