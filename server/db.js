@@ -1,0 +1,244 @@
+import Database from 'better-sqlite3';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const dbPath = path.join(__dirname, 'gold_trader.db');
+const db = new Database(dbPath);
+
+db.pragma('journal_mode = WAL');
+
+export function initDb() {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS candles_1m (
+      timestamp INTEGER PRIMARY KEY,
+      open REAL NOT NULL,
+      high REAL NOT NULL,
+      low REAL NOT NULL,
+      close REAL NOT NULL,
+      volume REAL NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS live_ticks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      timestamp INTEGER NOT NULL,
+      bid REAL NOT NULL,
+      ask REAL NOT NULL,
+      mid REAL NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_live_ticks_ts ON live_ticks(timestamp);
+
+    CREATE TABLE IF NOT EXISTS strategies (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      description TEXT,
+      code TEXT NOT NULL,
+      params TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS demo_account (
+      id TEXT PRIMARY KEY,
+      balance REAL NOT NULL,
+      initial_balance REAL NOT NULL,
+      currency TEXT NOT NULL DEFAULT 'USD',
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS ledger (
+      id TEXT PRIMARY KEY,
+      timestamp INTEGER NOT NULL,
+      type TEXT NOT NULL,
+      amount REAL NOT NULL,
+      balance_after REAL NOT NULL,
+      notes TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_ledger_ts ON ledger(timestamp);
+
+    CREATE TABLE IF NOT EXISTS trade_history (
+      id TEXT PRIMARY KEY,
+      strategy_id TEXT,
+      strategy_name TEXT,
+      forward_exec_id TEXT,
+      mode TEXT NOT NULL,
+      symbol TEXT NOT NULL DEFAULT 'XAU/USD',
+      side TEXT NOT NULL,
+      entry_time INTEGER NOT NULL,
+      exit_time INTEGER,
+      entry_price REAL NOT NULL,
+      exit_price REAL,
+      qty REAL NOT NULL,
+      leverage REAL DEFAULT 100,
+      pnl REAL,
+      pnl_pct REAL,
+      exit_reason TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS backtest_reports (
+      id TEXT PRIMARY KEY,
+      strategy_name TEXT NOT NULL,
+      timeframe TEXT NOT NULL,
+      start_date TEXT NOT NULL,
+      end_date TEXT NOT NULL,
+      metrics TEXT NOT NULL,
+      trades_json TEXT NOT NULL,
+      equity_curve_json TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS forward_executions (
+      id TEXT PRIMARY KEY,
+      strategy_id TEXT NOT NULL,
+      strategy_name TEXT NOT NULL,
+      timeframe TEXT NOT NULL,
+      leverage REAL NOT NULL DEFAULT 100,
+      qty REAL NOT NULL DEFAULT 10,
+      allocated_budget REAL NOT NULL DEFAULT 10000.0,
+      sl_pct REAL,
+      tp_pct REAL,
+      status TEXT NOT NULL, -- 'RUNNING', 'PAUSED', 'STOPPED'
+      started_at INTEGER NOT NULL,
+      paused_at INTEGER,
+      closed_trades_count INTEGER DEFAULT 0,
+      total_pnl REAL DEFAULT 0.0
+    );
+  `);
+
+  // Safe migrations for existing DB
+  try {
+    db.exec(`ALTER TABLE trade_history ADD COLUMN forward_exec_id TEXT`);
+  } catch (e) {}
+
+  try {
+    db.exec(`ALTER TABLE trade_history ADD COLUMN leverage REAL DEFAULT 100`);
+  } catch (e) {}
+
+  try {
+    db.exec(`ALTER TABLE forward_executions ADD COLUMN allocated_budget REAL DEFAULT 10000.0`);
+  } catch (e) {}
+
+  // Ensure default demo account exists
+  const row = db.prepare('SELECT * FROM demo_account WHERE id = ?').get('default');
+  if (!row) {
+    const now = new Date().toISOString();
+    const defaultBalance = 10000.00;
+    db.prepare(`
+      INSERT INTO demo_account (id, balance, initial_balance, currency, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+    `).run('default', defaultBalance, defaultBalance, 'USD', now);
+
+    db.prepare(`
+      INSERT INTO ledger (id, timestamp, type, amount, balance_after, notes)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run('ledger_init_' + Date.now(), Date.now(), 'DEPOSIT', defaultBalance, defaultBalance, 'Initial Demo Account Deposit');
+  }
+
+  const stratCount = db.prepare('SELECT COUNT(*) as count FROM strategies').get().count;
+  if (stratCount === 0) {
+    seedDefaultStrategies();
+  }
+}
+
+function seedDefaultStrategies() {
+  const defaultStrats = [
+    {
+      id: 'ema_crossover',
+      name: 'EMA Crossover Strategy',
+      description: 'Golden cross strategy buying when Fast EMA crosses above Slow EMA, selling when Fast EMA crosses below Slow EMA.',
+      code: `// EMA Crossover Strategy
+function calculateEMA(prices, period) {
+  if (prices.length < period) return null;
+  const k = 2 / (period + 1);
+  let ema = prices.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < prices.length; i++) {
+    ema = (prices[i] * k) + (ema * (1 - k));
+  }
+  return ema;
+}
+
+function onCandle(candle, history, state, params) {
+  const fastPeriod = params.fastPeriod || 9;
+  const slowPeriod = params.slowPeriod || 21;
+
+  if (history.length < slowPeriod + 1) return null;
+
+  const closes = history.map(c => c.close);
+  const prevCloses = closes.slice(0, closes.length - 1);
+
+  const currFast = calculateEMA(closes, fastPeriod);
+  const currSlow = calculateEMA(closes, slowPeriod);
+  const prevFast = calculateEMA(prevCloses, fastPeriod);
+  const prevSlow = calculateEMA(prevCloses, slowPeriod);
+
+  if (!currFast || !currSlow || !prevFast || !prevSlow) return null;
+
+  if (prevFast <= prevSlow && currFast > currSlow) {
+    return { action: 'BUY', slPct: params.slPct || 0.5, tpPct: params.tpPct || 1.0 };
+  }
+
+  if (prevFast >= prevSlow && currFast < currSlow) {
+    return { action: 'SELL', slPct: params.slPct || 0.5, tpPct: params.tpPct || 1.0 };
+  }
+
+  return null;
+}`,
+      params: JSON.stringify({ fastPeriod: 9, slowPeriod: 21, slPct: 0.5, tpPct: 1.0 }),
+      created_at: new Date().toISOString()
+    },
+    {
+      id: 'rsi_mean_reversion',
+      name: 'RSI Overbought/Oversold Reversal',
+      description: 'Buys when RSI drops below oversold threshold (30) and turns up; sells when RSI rises above overbought (70) and turns down.',
+      code: `// RSI Reversal Strategy
+function calculateRSI(closes, period = 14) {
+  if (closes.length < period + 1) return 50;
+  let gains = 0, losses = 0;
+  for (let i = closes.length - period; i < closes.length; i++) {
+    const diff = closes[i] - closes[i - 1];
+    if (diff >= 0) gains += diff;
+    else losses -= diff;
+  }
+  const avgGain = gains / period;
+  const avgLoss = losses / period;
+  if (avgLoss === 0) return 100;
+  const rs = avgGain / avgLoss;
+  return 100 - (100 / (1 + rs));
+}
+
+function onCandle(candle, history, state, params) {
+  const period = params.rsiPeriod || 14;
+  const oversold = params.oversold || 30;
+  const overbought = params.overbought || 70;
+
+  if (history.length < period + 2) return null;
+  const closes = history.map(c => c.close);
+  const currRSI = calculateRSI(closes, period);
+  const prevRSI = calculateRSI(closes.slice(0, closes.length - 1), period);
+
+  if (prevRSI <= oversold && currRSI > oversold) {
+    return { action: 'BUY', slPct: params.slPct || 0.4, tpPct: params.tpPct || 0.8 };
+  }
+  if (prevRSI >= overbought && currRSI < overbought) {
+    return { action: 'SELL', slPct: params.slPct || 0.4, tpPct: params.tpPct || 0.8 };
+  }
+  return null;}`,
+      params: JSON.stringify({ rsiPeriod: 14, oversold: 30, overbought: 70, slPct: 0.4, tpPct: 0.8 }),
+      created_at: new Date().toISOString()
+    }
+  ];
+
+  const stmt = db.prepare(`
+    INSERT INTO strategies (id, name, description, code, params, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+
+  for (const s of defaultStrats) {
+    stmt.run(s.id, s.name, s.description, s.code, s.params, s.created_at);
+  }
+}
+
+export default db;

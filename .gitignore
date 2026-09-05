@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+
+# Environment variables
+.env
+.env.local
+
+# Build output
+dist/
+build/
+.netlify/
+
+# OS / Editor files
+.DS_Store
+*.log
+
+# SQLite temporary WAL/SHM files
+*.db-wal
+*.db-shm
+
+# Data CSVs (large raw CSV files, SQLite db is used instead)
+*.csv
+HISTDATA_COM_ASCII_*
