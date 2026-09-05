@@ -158,9 +158,9 @@ app.delete('/api/strategies/:id', (req, res) => {
 });
 
 // 3. BACKTEST ENDPOINTS
-app.post('/api/backtest/run', (req, res) => {
+app.post('/api/backtest/run', async (req, res) => {
   try {
-    const result = runBacktest(req.body);
+    const result = await runBacktest(req.body);
 
     if (req.body.saveReport) {
       const reportId = 'report_' + Date.now();

@@ -1,7 +1,7 @@
 import db from './db.js';
 import { aggregateCandles } from './timeframeAggregator.js';
 
-export function runBacktest(options) {
+export async function runBacktest(options) {
   const {
     strategyCode,
     strategyParams = {},
@@ -49,7 +49,20 @@ export function runBacktest(options) {
     throw new Error(`Insufficient candle bars (${candles.length}) for timeframe ${timeframe}. Please expand date range.`);
   }
 
-  // 3. Prepare strategy function execution
+  // In-memory API response cache shared across backtest iterations
+  const apiCache = new Map();
+  const cachedFetch = async (url, fetchOptions = {}) => {
+    const cacheKey = `${fetchOptions.method || 'GET'}:${url}`;
+    if (apiCache.has(cacheKey)) {
+      return apiCache.get(cacheKey);
+    }
+    const response = await fetch(url, fetchOptions);
+    const data = await response.json();
+    apiCache.set(cacheKey, data);
+    return data;
+  };
+
+  // 3. Prepare strategy function execution (supports both async and sync onCandle)
   let strategyFn;
   try {
     const codeToEval = `
@@ -60,7 +73,7 @@ export function runBacktest(options) {
         throw new Error('Strategy must define an onCandle(candle, history, state, params) function.');
       }
     `;
-    strategyFn = new Function(codeToEval)();
+    strategyFn = new Function('cachedFetch', codeToEval)(cachedFetch);
   } catch (err) {
     throw new Error(`Strategy Script Syntax Error: ${err.message}`);
   }
@@ -71,7 +84,7 @@ export function runBacktest(options) {
   let activePosition = null; // { id, side, entryTime, entryPrice, qty, slPrice, tpPrice, requiredMargin }
   const closedTrades = [];
   const equityCurve = [];
-  const strategyState = {};
+  const strategyState = { cachedFetch };
 
   let peakEquity = initialBalance;
   let maxDrawdownDollars = 0;
@@ -171,10 +184,10 @@ export function runBacktest(options) {
       });
     }
 
-    // C. Evaluate strategy function for signals
+    // C. Evaluate strategy function for signals (await supports async/await onCandle)
     if (i >= 5 && balance > 0) {
       try {
-        const signal = strategyFn(candle, history, strategyState, strategyParams);
+        const signal = await strategyFn(candle, history, strategyState, strategyParams);
 
         if (signal && typeof signal === 'object' && signal.action) {
           const action = signal.action.toUpperCase();

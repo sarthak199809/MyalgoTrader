@@ -32,14 +32,16 @@ export function initForwardEngineFromDb() {
   for (const row of rows) {
     try {
       const strat = db.prepare('SELECT * FROM strategies WHERE id = ?').get(row.strategy_id);
-      if (!strat) continue;
-
+      const cachedFetch = async (url, fetchOptions = {}) => {
+        const response = await fetch(url, fetchOptions);
+        return response.json();
+      };
       const codeToEval = `
         ${strat.code}
         if (typeof onCandle === 'function') return onCandle;
         throw new Error('No onCandle function defined');
       `;
-      const strategyFn = new Function(codeToEval)();
+      const strategyFn = new Function('cachedFetch', codeToEval)(cachedFetch);
 
       activeExecutionsMap.set(row.id, {
         id: row.id,
@@ -60,7 +62,7 @@ export function initForwardEngineFromDb() {
         closedTradesCount: row.closed_trades_count || 0,
         totalPnl: row.total_pnl || 0.0,
         activePosition: null,
-        state: {},
+        state: { cachedFetch },
         evaluationsCount: 0,
         lastEvaluatedAt: null,
         lastSignal: 'LISTENING (Hold)',
@@ -128,13 +130,17 @@ export function startForwardExecution(options) {
   }
 
   let strategyFn;
+  const cachedFetch = async (url, fetchOptions = {}) => {
+    const response = await fetch(url, fetchOptions);
+    return response.json();
+  };
   try {
     const codeToEval = `
       ${strat.code}
       if (typeof onCandle === 'function') return onCandle;
       throw new Error('No onCandle function defined');
     `;
-    strategyFn = new Function(codeToEval)();
+    strategyFn = new Function('cachedFetch', codeToEval)(cachedFetch);
   } catch (err) {
     throw new Error(`Invalid strategy code: ${err.message}`);
   }
@@ -168,7 +174,7 @@ export function startForwardExecution(options) {
     closedTradesCount: 0,
     totalPnl: 0.0,
     activePosition: null,
-    state: {},
+    state: { cachedFetch },
     evaluationsCount: 0,
     lastEvaluatedAt: null,
     lastSignal: 'LISTENING (Hold)',
@@ -212,12 +218,16 @@ export function resumeForwardExecution(execId) {
     if (row) {
       const strat = db.prepare('SELECT * FROM strategies WHERE id = ?').get(row.strategy_id);
       if (strat) {
+        const cachedFetch = async (url, fetchOptions = {}) => {
+          const response = await fetch(url, fetchOptions);
+          return response.json();
+        };
         const codeToEval = `
           ${strat.code}
           if (typeof onCandle === 'function') return onCandle;
           throw new Error('No onCandle function defined');
         `;
-        const strategyFn = new Function(codeToEval)();
+        const strategyFn = new Function('cachedFetch', codeToEval)(cachedFetch);
 
         activeExecutionsMap.set(row.id, {
           id: row.id,
@@ -238,7 +248,7 @@ export function resumeForwardExecution(execId) {
           closedTradesCount: row.closed_trades_count || 0,
           totalPnl: row.total_pnl || 0.0,
           activePosition: null,
-          state: {},
+          state: { cachedFetch },
           evaluationsCount: 0,
           lastEvaluatedAt: null,
           lastSignal: 'LISTENING (Hold)',
@@ -338,7 +348,7 @@ registerForwardEngine((quote) => {
     const lastCandle = candles[candles.length - 1];
 
     try {
-      const signal = exec.strategyFn(lastCandle, candles, exec.state, exec.params);
+      const signal = await exec.strategyFn(lastCandle, candles, exec.state, exec.params);
       exec.lastError = null;
 
       if (signal && typeof signal === 'object' && signal.action) {

@@ -228,6 +228,53 @@ function onCandle(candle, history, state, params) {
   return null;}`,
       params: JSON.stringify({ rsiPeriod: 14, oversold: 30, overbought: 70, slPct: 0.4, tpPct: 0.8 }),
       created_at: new Date().toISOString()
+    },
+    {
+      id: 'external_sentiment_api',
+      name: 'Async Market Sentiment API Strategy',
+      description: 'Demonstrates calling external 3rd-party Market Sentiment API with async/await and automatic caching.',
+      code: `// Async 3rd-Party Market Sentiment API Strategy
+async function fetchMarketSentiment(timestamp, apiUrl) {
+  // Use cachedFetch helper provided by the engine to prevent duplicate HTTP calls
+  if (typeof cachedFetch === 'function') {
+    try {
+      const url = \`\${apiUrl}?ts=\${timestamp}\`;
+      const data = await cachedFetch(url);
+      return data.score; // Expects API score between 0.0 (Bearish) and 1.0 (Bullish)
+    } catch (e) {
+      // Fallback or mock sentiment if API is offline
+      return 0.5;
+    }
+  }
+  return 0.5;
+}
+
+async function onCandle(candle, history, state, params) {
+  const apiUrl = params.sentimentApiUrl || 'https://api.example.com/sentiment';
+  
+  // 1. Fetch async market sentiment score for this candle timestamp
+  const sentimentScore = await fetchMarketSentiment(candle.timestamp, apiUrl);
+
+  // 2. Combine price momentum with market sentiment
+  if (history.length < 5) return null;
+  const lastClose = candle.close;
+  const prevClose = history[history.length - 2].close;
+  const priceUp = lastClose > prevClose;
+
+  // Bullish signal: Price moving up AND sentiment score > 0.65
+  if (priceUp && sentimentScore > 0.65) {
+    return { action: 'BUY', slPct: params.slPct || 0.5, tpPct: params.tpPct || 1.0 };
+  }
+
+  // Bearish signal: Price moving down AND sentiment score < 0.35
+  if (!priceUp && sentimentScore < 0.35) {
+    return { action: 'SELL', slPct: params.slPct || 0.5, tpPct: params.tpPct || 1.0 };
+  }
+
+  return null;
+}`,
+      params: JSON.stringify({ sentimentApiUrl: 'https://api.example.com/sentiment', slPct: 0.5, tpPct: 1.0 }),
+      created_at: new Date().toISOString()
     }
   ];
 
