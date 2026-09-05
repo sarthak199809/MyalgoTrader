@@ -137,6 +137,71 @@ export function initDb() {
     `).run('ledger_init_' + Date.now(), Date.now(), 'DEPOSIT', defaultBalance, defaultBalance, 'Initial Demo Account Deposit');
   }
 
+  // Insert or update market sentiment strategy
+  const netlifySentimentStrat = {
+    id: 'basic_stier_market_sentiment',
+    name: 'Basic - S tier + Market Sentiment',
+    description: 'Combines Technical Signals with live/historical Market Sentiment API (clinquant-tulumba-c7b230.netlify.app)',
+    code: `// Basic - S tier + Market Sentiment Strategy
+async function fetchMarketScore(timestampMs) {
+  // Format Unix timestamp (ms) to UTC Hourly ISO string (YYYY-MM-DDTHH:00:00Z)
+  const d = new Date(timestampMs);
+  const year = d.getUTCFullYear();
+  const month = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(d.getUTCDate()).padStart(2, '0');
+  const hour = String(d.getUTCHours()).padStart(2, '0');
+  const isoHour = \`\${year}-\${month}-\${day}T\${hour}:00:00Z\`;
+
+  const url = \`https://clinquant-tulumba-c7b230.netlify.app/api/score/timestamp/\${isoHour}\`;
+
+  try {
+    if (typeof cachedFetch === 'function') {
+      const res = await cachedFetch(url);
+      if (res && res.data && typeof res.data.market_score === 'number') {
+        return res.data.market_score;
+      }
+    }
+  } catch (err) {
+    console.error('Market Score API Error:', err.message);
+  }
+  return 0.5; // Default neutral fallback
+}
+
+async function onCandle(candle, history, state, params) {
+  if (history.length < 5) return null;
+
+  // 1. Fetch market score from 3rd-party API
+  const score = await fetchMarketScore(candle.timestamp);
+
+  const slPct = params.slPct || 0.5;
+  const tpPct = params.tpPct || 1.0;
+
+  // 2. Execute trades based on Quant Strategy Matrix Thresholds
+  // Score > 0.60 -> Bullish (Buy)
+  if (score > 0.60) {
+    return { action: 'BUY', slPct, tpPct };
+  }
+
+  // Score < 0.40 -> Bearish (Sell)
+  if (score < 0.40) {
+    return { action: 'SELL', slPct, tpPct };
+  }
+
+  // 0.40 <= score <= 0.60 -> Neutral (No New Trade)
+  return null;
+}`,
+    params: JSON.stringify({ slPct: 0.5, tpPct: 1.0 }),
+    created_at: new Date().toISOString()
+  };
+
+  const existingStrat = db.prepare('SELECT id FROM strategies WHERE id = ?').get(netlifySentimentStrat.id);
+  if (!existingStrat) {
+    db.prepare(`
+      INSERT INTO strategies (id, name, description, code, params, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(netlifySentimentStrat.id, netlifySentimentStrat.name, netlifySentimentStrat.description, netlifySentimentStrat.code, netlifySentimentStrat.params, netlifySentimentStrat.created_at);
+  }
+
   const stratCount = db.prepare('SELECT COUNT(*) as count FROM strategies').get().count;
   if (stratCount === 0) {
     seedDefaultStrategies();
