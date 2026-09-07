@@ -329,6 +329,87 @@ async function onCandle(candle, history, state, params) {
       params=excluded.params
   `).run(netlifySentimentStrat.id, netlifySentimentStrat.name, netlifySentimentStrat.description, netlifySentimentStrat.code, netlifySentimentStrat.params, netlifySentimentStrat.created_at);
 
+  // Insert or update VWAP Strategy
+  const vwapStrat = {
+    id: 'vwap_trend_strategy',
+    name: 'VWAP Strategy',
+    description: 'Volume Weighted Average Price (VWAP) crossover strategy with EMA trend filter and ATR risk management',
+    code: `/**
+ * VWAP Strategy (Volume Weighted Average Price)
+ */
+function onCandle(candle, history, state, params) {
+  const vwapPeriod  = params.vwapPeriod || 20;
+  const emaPeriod   = params.emaPeriod  || 50;
+  const slPct       = params.slPct      || 0.4;
+  const tpPct       = params.tpPct      || 1.0;
+
+  const minRequired = Math.max(vwapPeriod, emaPeriod) + 2;
+  if (history.length < minRequired) return null;
+
+  // 1. Calculate Rolling VWAP
+  const sub = history.slice(-vwapPeriod);
+  let sumPV = 0, sumV = 0;
+  for (const c of sub) {
+    const tp = (c.high + c.low + c.close) / 3;
+    const vol = c.volume && c.volume > 0 ? c.volume : 1; // Fallback to 1 if volume is 0
+    sumPV += tp * vol;
+    sumV += vol;
+  }
+  const vwap = sumV > 0 ? sumPV / sumV : candle.close;
+
+  // 2. Previous Candle VWAP for Crossover Check
+  const prevSub = history.slice(-vwapPeriod - 1, -1);
+  let pSumPV = 0, pSumV = 0;
+  for (const c of prevSub) {
+    const tp = (c.high + c.low + c.close) / 3;
+    const vol = c.volume && c.volume > 0 ? c.volume : 1;
+    pSumPV += tp * vol;
+    pSumV += vol;
+  }
+  const prevVwap = pSumV > 0 ? pSumPV / pSumV : history[history.length - 2].close;
+
+  // 3. EMA Trend Filter
+  const closes = history.map(c => c.close);
+  const k = 2 / (emaPeriod + 1);
+  let ema = closes.slice(0, emaPeriod).reduce((a, b) => a + b, 0) / emaPeriod;
+  for (let i = emaPeriod; i < closes.length; i++) {
+    ema = (closes[i] * k) + (closes[i] * (1 - k));
+  }
+
+  const currentClose = candle.close;
+  const prevClose = history[history.length - 2].close;
+
+  // Bullish: Price crosses ABOVE VWAP & Price is above Trend EMA
+  if (prevClose <= prevVwap && currentClose > vwap && currentClose > ema) {
+    return { action: 'BUY', slPct, tpPct };
+  }
+
+  // Bearish: Price crosses BELOW VWAP & Price is below Trend EMA
+  if (prevClose >= prevVwap && currentClose < vwap && currentClose < ema) {
+    return { action: 'SELL', slPct, tpPct };
+  }
+
+  return null;
+}`,
+    params: JSON.stringify({
+      vwapPeriod: 20,
+      emaPeriod: 50,
+      slPct: 0.4,
+      tpPct: 1.0
+    }),
+    created_at: new Date().toISOString()
+  };
+
+  db.prepare(`
+    INSERT INTO strategies (id, name, description, code, params, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      name=excluded.name,
+      description=excluded.description,
+      code=excluded.code,
+      params=excluded.params
+  `).run(vwapStrat.id, vwapStrat.name, vwapStrat.description, vwapStrat.code, vwapStrat.params, vwapStrat.created_at);
+
   const stratCount = db.prepare('SELECT COUNT(*) as count FROM strategies').get().count;
   if (stratCount === 0) {
     seedDefaultStrategies();
